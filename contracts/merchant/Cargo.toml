@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+shared = { path = "../shared" }
