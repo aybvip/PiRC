@@ -3,10 +3,41 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol, By
 
 // ============================================================================
 // Dispute Resolution Contract — PiDCTP Module 3
+// + Juror Vetting, Reputation-Weighted Voting (v1.1)
 // ============================================================================
 
 #[contract]
 pub struct DisputeContract;
+
+// ============================================================================
+// v1.1: Juror Vetting
+// Jurors must meet minimum reputation and have relevant expertise
+// ============================================================================
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub enum JurorSpecialty {
+    General,            // No specialty — can serve on any case
+    Commerce,           // Specializes in commerce/trade disputes
+    DigitalGoods,       // Specializes in digital product disputes
+    Services,           // Specializes in service disputes
+    Subscription,       // Specializes in PiRC2 subscription disputes
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct JurorVettingProfile {
+    pub juror: Address,
+    pub reputation_score: u32,      // Current reputation score
+    pub cases_served: u32,          // Total disputes served as juror
+    pub cases_consensus: u32,       // Times juror voted with majority
+    pub consensus_rate: u32,        // cases_consensus/cases_served * 10000
+    pub specialty: JurorSpecialty,
+    pub active: bool,               // Currently available for selection
+    pub stake: i128,                // Pi staked as juror bond
+    pub last_served: u64,
+    pub penalty_points: u32,        // Accumulated penalties for non-participation
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[contracttype]
@@ -367,10 +398,214 @@ impl DisputeContract {
         env.storage().persistent().get(&dispute_key(dispute_id)).unwrap()
     }
 
+    // ========================================================================
+    // v1.1: Juror Vetting Functions
+    // ========================================================================
+
+    /// Register as a potential juror (requires minimum Silver reputation + stake)
+    pub fn register_juror(
+        env: Env,
+        juror: Address,
+        specialty: JurorSpecialty,
+        reputation_score: u32,
+        stake: i128,
+    ) {
+        require_not_paused(&env);
+        juror.require_auth();
+
+        // Minimum requirements: Silver tier (200+) and 10 Pi stake
+        assert!(reputation_score >= 200, "Min Silver reputation");
+        assert!(stake >= 1_000_000_000, "Min 10 Pi stake"); // 10 Pi in stroops
+
+        let vetting_key = (Symbol::new("juror_vet"), juror.clone());
+        assert!(
+            !env.storage().persistent().has(&vetting_key),
+            "Already registered"
+        );
+
+        let profile = JurorVettingProfile {
+            juror: juror.clone(),
+            reputation_score,
+            cases_served: 0,
+            cases_consensus: 0,
+            consensus_rate: 10000, // Start at 100%
+            specialty,
+            active: true,
+            stake,
+            last_served: 0,
+            penalty_points: 0,
+        };
+
+        env.storage().persistent().set(&vetting_key, &profile);
+
+        env.events().publish(
+            (Symbol::new("juror_registered"), juror),
+            (specialty, reputation_score, stake),
+        );
+    }
+
+    /// Deactivate juror (stop being selected for new cases)
+    pub fn deactivate_juror(env: Env, juror: Address) {
+        require_not_paused(&env);
+        juror.require_auth();
+
+        let vetting_key = (Symbol::new("juror_vet"), juror.clone());
+        let mut profile: JurorVettingProfile = env.storage().persistent().get(&vetting_key).unwrap();
+        profile.active = false;
+        env.storage().persistent().set(&vetting_key, &profile);
+
+        env.events().publish(
+            (Symbol::new("juror_deactivated"), juror),
+            (),
+        );
+    }
+
+    /// Get juror vetting profile
+    pub fn get_juror_profile(env: Env, juror: Address) -> JurorVettingProfile {
+        let vetting_key = (Symbol::new("juror_vet"), juror);
+        env.storage().persistent().get(&vetting_key).unwrap()
+    }
+
+    /// Check if a juror is eligible for a specific dispute category
+    pub fn is_juror_eligible(env: Env, juror: Address, category: DisputeCategory) -> bool {
+        let vetting_key = (Symbol::new("juror_vet"), juror);
+        match env.storage().persistent().get::<_, JurorVettingProfile>(&vetting_key) {
+            Some(profile) => {
+                if !profile.active { return false; }
+                if profile.penalty_points > 3 { return false; }
+                // Specialty matching: General can serve any, others match specific categories
+                match profile.specialty {
+                    JurorSpecialty::General => true,
+                    JurorSpecialty::Commerce => matches!(category,
+                        DisputeCategory::NonDelivery | DisputeCategory::NotAsDescribed |
+                        DisputeCategory::UnauthorizedCharge | DisputeCategory::Other),
+                    JurorSpecialty::DigitalGoods => matches!(category,
+                        DisputeCategory::NotAsDescribed | DisputeCategory::DamagedDefective),
+                    JurorSpecialty::Services => matches!(category,
+                        DisputeCategory::ServiceNotProvided | DisputeCategory::DeliveryDispute),
+                    JurorSpecialty::Subscription => matches!(category,
+                        DisputeCategory::UnauthorizedCharge | DisputeCategory::ServiceNotProvided),
+                }
+            }
+            None => false,
+        }
+    }
+
+    // ========================================================================
+    // v1.1: Reputation-Weighted Voting
+    // Higher-reputation jurors have proportionally more voting weight
+    // ========================================================================
+
+    /// Execute ruling with reputation-weighted vote counting
+    /// Instead of 1-juror-1-vote, each juror's vote is weighted by their reputation
+    pub fn execute_weighted_ruling(
+        env: Env,
+        caller: Address,
+        dispute_id: u64,
+    ) -> (DisputeRuling, u32, u32) {
+        require_coordinator(&env, &caller);
+
+        let mut dispute: DisputeCase = env.storage().persistent().get(&dispute_key(dispute_id)).unwrap();
+        assert!(dispute.phase == DisputePhase::Ruling, "Not ruling phase");
+
+        // Count votes with reputation weighting
+        let mut weighted_votes: Map<DisputeRuling, u32> = Map::new(&env);
+        let mut total_weight: u32 = 0;
+
+        for (juror, commit) in dispute.commit_votes.iter() {
+            if commit.revealed {
+                if let Some(ref vote) = commit.actual_vote {
+                    // Get juror's weight from their vetting profile
+                    let weight = get_juror_weight(&env, &juror);
+                    let current = weighted_votes.get(vote.clone()).unwrap_or(0);
+                    weighted_votes.set(vote.clone(), current + weight);
+                    total_weight += weight;
+                }
+            }
+        }
+
+        assert!(total_weight > 0, "No weighted votes");
+
+        // Find majority by weighted votes
+        let mut winning_ruling = DisputeRuling::Dismissed;
+        let mut max_weighted: u32 = 0;
+        for (ruling, weight) in weighted_votes.iter() {
+            if weight > max_weighted {
+                max_weighted = weight;
+                winning_ruling = ruling;
+            }
+        }
+
+        // Update juror consensus stats
+        update_juror_consensus(&env, &dispute, &winning_ruling);
+
+        dispute.ruling = Some(winning_ruling.clone());
+        dispute.phase = DisputePhase::Final;
+        env.storage().persistent().set(&dispute_key(dispute_id), &dispute);
+
+        env.events().publish(
+            (Symbol::new("weighted_ruling"), dispute_id),
+            (winning_ruling.clone(), max_weighted, total_weight),
+        );
+
+        (winning_ruling, max_weighted, total_weight)
+    }
+
     /// Emergency pause
     pub fn set_paused(env: Env, caller: Address, paused: bool) {
         require_coordinator(&env, &caller);
         env.storage().instance().set(&PAUSED, &paused);
+    }
+}
+
+/// Get juror voting weight based on reputation score
+/// Bronze=1, Silver=2, Gold=3, Platinum=4, Diamond=5
+/// Plus consensus bonus: high consensus rate jurors get +1 weight
+fn get_juror_weight(env: &Env, juror: &Address) -> u32 {
+    let vetting_key = (Symbol::new("juror_vet"), juror.clone());
+    match env.storage().persistent().get::<_, JurorVettingProfile>(&vetting_key) {
+        Some(profile) => {
+            let base_weight = if profile.reputation_score >= 900 { 5 }
+                else if profile.reputation_score >= 700 { 4 }
+                else if profile.reputation_score >= 450 { 3 }
+                else if profile.reputation_score >= 200 { 2 }
+                else { 1 };
+
+            // Consensus bonus: jurors with >80% consensus get +1
+            let consensus_bonus = if profile.consensus_rate > 8000 && profile.cases_served >= 3 { 1 } else { 0 };
+
+            base_weight + consensus_bonus
+        }
+        None => 1, // Unvetted juror gets minimum weight
+    }
+}
+
+/// Update juror consensus statistics after ruling
+fn update_juror_consensus(env: &Env, dispute: &DisputeCase, winning_ruling: &DisputeRuling) {
+    for (juror, commit) in dispute.commit_votes.iter() {
+        let vetting_key = (Symbol::new("juror_vet"), juror.clone());
+        if let Some(mut profile) = env.storage().persistent().get::<_, JurorVettingProfile>(&vetting_key) {
+            profile.cases_served += 1;
+            if commit.revealed {
+                if let Some(ref vote) = commit.actual_vote {
+                    if vote == winning_ruling {
+                        profile.cases_consensus += 1;
+                    }
+                }
+            } else {
+                // Non-reveal penalty
+                profile.penalty_points += 1;
+            }
+
+            // Recalculate consensus rate
+            if profile.cases_served > 0 {
+                profile.consensus_rate = (profile.cases_consensus as u64 * 10000
+                    / profile.cases_served as u64) as u32;
+            }
+
+            profile.last_served = env.ledger().timestamp();
+            env.storage().persistent().set(&vetting_key, &profile);
+        }
     }
 }
 
