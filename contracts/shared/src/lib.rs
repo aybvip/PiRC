@@ -97,6 +97,10 @@ pub struct GroupParticipant { pub buyer: Address, pub amount: i128, pub funded: 
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GroupEscrow { pub escrow_id: u64, pub organizer: Address, pub seller: Address, pub token: Address, pub total_amount: i128, pub funded_amount: i128, pub state: GroupEscrowState, pub participants: Vec<GroupParticipant>, pub created_at: u64, pub funding_deadline: u64, pub delivery_deadline: u64, pub auto_release_timeout: u64, pub order_metadata: BytesN<32> }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BadgeOwnership { pub pioneer: Address, pub badge: SoulboundBadge, pub awarded_at: u64, pub award_reason: BytesN<32>, pub revoked: bool }
 
 #[contracttype]
@@ -122,3 +126,11 @@ pub struct LoyaltyProfile { pub pioneer: Address, pub points: u32, pub tier: Loy
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModuleAddresses { pub escrow: Address, pub reputation: Address, pub dispute: Address, pub merchant_verification: Address, pub loyalty: Address }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JurorVote { pub juror: Address, pub vote: DisputeRuling, pub confidence: u8, pub voted_at: u64, pub justification_hash: BytesN<32> }
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeCase { pub dispute_id: u64, pub escrow_id: u64, pub filer: Address, pub respondent: Address, pub category: DisputeCategory, pub phase: DisputePhase, pub jurors: Vec<Address>, pub votes: Vec<JurorVote>, pub filer_evidence: Vec<BytesN<32>>, pub respondent_evidence: Vec<BytesN<32>>, pub filed_at: u64, pub evidence_deadline: u64, pub voting_deadline: u64, pub ruling: Option<DisputeRuling>, pub is_appealed: bool, pub appeal_fee: i128 }
