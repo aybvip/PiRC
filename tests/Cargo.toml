@@ -1,0 +1,11 @@
+[package]
+name = "pidctp-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+soroban-sdk = { version = "20.0.0", features = ["testutils"] }
+
+[[test]]
+name = "full_flow_test"
+path = "integration/full_flow_test.rs"
